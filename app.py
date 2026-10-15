@@ -1,139 +1,143 @@
 import streamlit as st
-import time
-from google import genai
+import pandas as pd
+import random
 
-# ==========================================
-# 0. APIキーの設定
-# ==========================================
-API_KEY = st.secrets["GEMINI_API_KEY"]
+# --- 1. スマホ画面用の基本設定とデザイン調整 ---
+st.set_page_config(
+    page_title="弁理士 一問一答",
+    page_icon="⚖️",
+    layout="centered",
+    initial_sidebar_state="collapsed"
+)
 
-# ==========================================
-# 1. 問題データの準備
-# ==========================================
-questions = [
-    {
-        "id": 1,
-        "subject": "特許法",
-        "question": "特許出願の分割（特許法第44条）は、特許査定の謄本送達後においても、一定の期間内であれば行うことができる。正しいか誤りか。",
-        "choices": ["正しい", "誤り"],
-        "answer": "正しい",
-        "explanation": "特許法第44条第1項第2号の規定により、特許査定の謄本送達があった日から30日以内であれば分割出願が可能です。"
-    },
-    {
-        "id": 2,
-        "subject": "実用新案法",
-        "question": "実用新案技術評価書の請求は、出願人以外の何人も行うことができない。正しいか誤りか。",
-        "choices": ["正しい", "誤り"],
-        "answer": "誤り",
-        "explanation": "実用新案法第12条第1項の規定により、何人も、実用新案権の設定の登録があった後は、実用新案技術評価書を請求することができます。"
+# スマホで親指操作しやすくするためのデザイン（CSS）
+st.markdown("""
+<style>
+    .block-container {
+        padding-top: 1.5rem !important;
+        padding-bottom: 4rem !important;
     }
-]
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    /* ボタンを大きく・押しやすく */
+    div.stButton > button {
+        width: 100%;
+        height: 3.8rem;
+        font-size: 1.2rem !important;
+        font-weight: bold;
+        border-radius: 12px;
+        margin-bottom: 0.5rem;
+    }
+    /* 問題文のカードデザイン */
+    .question-box {
+        background-color: #f8f9fa;
+        padding: 1.2rem;
+        border-radius: 12px;
+        border-left: 5px solid #1f77b4;
+        font-size: 1.1rem;
+        line-height: 1.6;
+        margin-bottom: 1.2rem;
+        color: #1e1e1e;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# ==========================================
-# 2. アプリの状態（State）を管理する
-# ==========================================
-if "current_q_index" not in st.session_state:
-    st.session_state.current_q_index = 0
-if "show_explanation" not in st.session_state:
-    st.session_state.show_explanation = False
-if "user_answer" not in st.session_state:
-    st.session_state.user_answer = None
-if "ai_response" not in st.session_state:
-    st.session_state.ai_response = None
+# --- 2. Googleスプレッドシートからデータを読み込む ---
+# 先ほど自動作成したスプレッドシートの専用読み込みURLです
+CSV_URL = "https://docs.google.com/spreadsheets/d/1PzRg1YruyR-7tRcOs289Zob1g9diKQxZFlsEnoxiqb0/export?format=csv"
 
-current_q = questions[st.session_state.current_q_index]
+@st.cache_data(ttl=60) # 60秒ごとに最新のスプレッドシートを自動反映
+def load_data():
+    df = pd.read_csv(CSV_URL)
+    return df.dropna(subset=["問題文"])
 
-# ==========================================
-# 3. 画面の描画（UI）
-# ==========================================
-st.title("弁理士試験 短答式対策アプリ")
-st.caption(f"全 {len(questions)} 問中 / {st.session_state.current_q_index + 1} 問目 （科目：{current_q['subject']}）")
+try:
+    df = load_data()
+except Exception as e:
+    st.error("スプレッドシートの読み込みに失敗しました。スプレッドシートの共有設定が「リンクを知っている全員」になっているか確認してください。")
+    st.stop()
 
-st.subheader("問題")
-st.write(current_q["question"])
+# --- 3. 出題の順番や状態の管理 ---
+if "q_index" not in st.session_state:
+    st.session_state.q_index = 0
+if "answered" not in st.session_state:
+    st.session_state.answered = False
+if "user_choice" not in st.session_state:
+    st.session_state.user_choice = None
+if "score" not in st.session_state:
+    st.session_state.score = {"correct": 0, "total": 0}
 
-# ==========================================
-# 4. 回答フォームと解説
-# ==========================================
-if not st.session_state.show_explanation:
-    selected_option = st.radio("選択肢を選んでください：", current_q["choices"])
-    if st.button("回答する"):
-        st.session_state.user_answer = selected_option
-        st.session_state.show_explanation = True
+# サイドバー（メニュー）にシャッフルボタンや再読み込みボタンを配置
+with st.sidebar:
+    st.header("⚙️ メニュー")
+    if st.button("🔄 最新のスプレッドシートを再読込"):
+        st.cache_data.clear()
+        st.rerun()
+    
+    # 科目フィルタ
+    subjects = ["すべて"] + list(df["科目"].unique())
+    selected_subject = st.selectbox("科目で絞り込む", subjects)
+
+if selected_subject != "すべて":
+    df = df[df["科目"] == selected_subject].reset_index(drop=True)
+
+total_q = len(df)
+if total_q == 0:
+    st.warning("問題データがありません。")
+    st.stop()
+
+# インデックスが範囲外にならないよう調整
+current_idx = st.session_state.q_index % total_q
+row = df.iloc[current_idx]
+
+# --- 4. アプリのメイン画面表示 ---
+st.caption(f"📊 正解数: {st.session_state.score['correct']} / {st.session_state.score['total']} 問  ｜  全 {total_q} 問中 {current_idx + 1} 問目")
+st.subheader(f"【{row['科目']}】 {row['年度・問題番号']}（枝{row['枝番']}）")
+
+# 問題文の表示
+st.markdown(f"<div class='question-box'>{row['問題文']}</div>", unsafe_allow_html=True)
+
+# ◯ × ボタン（横並び）
+col1, col2 = st.columns(2)
+with col1:
+    if st.button("◯ 正しい", disabled=st.session_state.answered):
+        st.session_state.answered = True
+        st.session_state.user_choice = "◯"
+        st.session_state.score["total"] += 1
+        if row["正解"] == "◯":
+            st.session_state.score["correct"] += 1
         st.rerun()
 
-else:
-    st.write(f"あなたの回答: **{st.session_state.user_answer}**")
-    if st.session_state.user_answer == current_q["answer"]:
-        st.success("正解です！")
+with col2:
+    if st.button("× 誤り", disabled=st.session_state.answered):
+        st.session_state.answered = True
+        st.session_state.user_choice = "×"
+        st.session_state.score["total"] += 1
+        if row["正解"] == "×":
+            st.session_state.score["correct"] += 1
+        st.rerun()
+
+# --- 5. 回答後の正誤判定と解説表示 ---
+if st.session_state.answered:
+    is_correct = (st.session_state.user_choice == row["正解"])
+    if is_correct:
+        st.success(f"⭕ **大正解！** （正解：{row['正解']}）")
     else:
-        st.error(f"不正解です。正解は「{current_q['answer']}」です。")
+        st.error(f"❌ **不正解...** （正解：{row['正解']}）")
     
-    st.info(f"【解説】\n{current_q['explanation']}")
-    
-    # ----------------------------------------
-    # 5. AI講師への深掘り質問エリア（自動リトライ機能付き）
-    # ----------------------------------------
-    st.divider()
-    st.subheader("🤖 AI講師に深掘り質問")
-    
-    user_question = st.text_input("解説で分からない点や、関連する条文（拒絶査定の場合は？など）について質問してください：")
-    
-    if st.button("AIに質問する"):
-        if user_question:
-            with st.spinner("AI講師が回答を作成しています..."):
-                client = genai.Client(api_key=API_KEY)
-                prompt = f"""
-                あなたは厳密で分かりやすい弁理士試験の専任講師です。
-                以下の【問題】と【解説】に関する生徒からの【質問】に答えてください。
-                必要に応じて関連する条文の趣旨や、試験での引っ掛けポイントなども解説してください。
+    st.info(f"💡 **解説**\n\n{row['解説']}")
 
-                【問題】{current_q['question']}
-                【正解】{current_q['answer']}
-                【基本解説】{current_q['explanation']}
-
-                【生徒の質問】{user_question}
-                """
-                
-                # 最大3回まで自動で再試行する仕組み
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        response = client.models.generate_content(
-                            model='gemini-3.8-flash',
-                            contents=prompt
-                        )
-                        st.session_state.ai_response = response.text
-                        break # 成功したらループを抜ける
-                    except Exception as e:
-                        if "503" in str(e) and attempt < max_retries - 1:
-                            # 503エラー（混雑）の場合は、2秒待ってからもう一度試す
-                            time.sleep(2)
-                            continue
-                        else:
-                            # 3回試してもダメだった場合や別のエラーの場合は画面に表示
-                            st.error(f"サーバーが混み合っているため、少し時間をおいて再度お試しください。（詳細: {e}）")
-                            break
-
-    if st.session_state.ai_response:
-        st.success(st.session_state.ai_response)
-
-    # ----------------------------------------
-    # 6. 次の問題へ進む処理
-    # ----------------------------------------
-    st.divider()
-    if st.session_state.current_q_index < len(questions) - 1:
-        if st.button("次の問題へ"):
-            st.session_state.current_q_index += 1
-            st.session_state.show_explanation = False
-            st.session_state.user_answer = None
-            st.session_state.ai_response = None
+    # 次の問題へ進むボタン
+    col_next1, col_next2 = st.columns(2)
+    with col_next1:
+        if st.button("➡️ 次の問題へ"):
+            st.session_state.q_index += 1
+            st.session_state.answered = False
+            st.session_state.user_choice = None
             st.rerun()
-    else:
-        st.write("すべての問題が終了しました！お疲れ様でした。")
-        if st.button("最初からやり直す"):
-            st.session_state.current_q_index = 0
-            st.session_state.show_explanation = False
-            st.session_state.user_answer = None
-            st.session_state.ai_response = None
+    with col_next2:
+        if st.button("🎲 ランダムに出題"):
+            st.session_state.q_index = random.randint(0, total_q - 1)
+            st.session_state.answered = False
+            st.session_state.user_choice = None
             st.rerun()
